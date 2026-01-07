@@ -16,6 +16,8 @@ using namespace std;
 #include <string>
 
 #define SERIAL_PORT "/dev/ttyACM0"
+#define BANK_SIZE 0x4000  // 16KB per bank
+#define DEFAULT_NUM_BANKS 128  // Default number of banks to read (2MB)
 
 int checkBankExtension(const char* str) {
     string s(str);
@@ -32,6 +34,74 @@ string getBankNum(const char* str) {
     return s.substr(s.length()-2);
 }
 
+// Read mode - dump flash contents to file
+int readFlashToFile(serialib& serial, const string& filename, int startBank, int numBanks) {
+    char buf[4096];
+    char lineBuf[256];
+    char cmdBuf[64];
+    
+    printf("Reading banks %d-%d (%d KB) to %s...\n", startBank, startBank + numBanks - 1, numBanks * 16, filename.c_str());
+    
+    // Wait for "Ready!" - consume all startup messages
+    serial.readString(lineBuf, '!', 256, 5000);  // Hello world!
+    serial.readString(lineBuf, '!', 256, 5000);  // Ready!
+    printf("Device ready\n");
+    
+    // Open output file
+    ofstream outFile(filename.c_str(), ios::binary);
+    if (!outFile.is_open()) {
+        printf("Error: Could not open output file %s\n", filename.c_str());
+        return -1;
+    }
+    
+    unsigned long totalBytes = 0;
+    int endBank = startBank + numBanks;
+    
+    for (int bank = startBank; bank < endBank; bank++) {
+        // Shift to bank
+        sprintf(cmdBuf, "shift %x\r", bank);
+        serial.writeString(cmdBuf);
+        // Consume until we see OK or prompt
+        serial.readString(lineBuf, '\n', 256, 1000);  // echo
+        serial.readString(lineBuf, '\n', 256, 1000);  // response
+        serial.readString(lineBuf, '>', 256, 1000);   // wait for prompt
+        
+        // Read 16KB in 4KB chunks (4 chunks per bank)
+        for (int chunk = 0; chunk < 4; chunk++) {
+            unsigned int addr = chunk * 0x1000;
+            sprintf(cmdBuf, "readMulti %x 1000\r", addr);
+            serial.writeString(cmdBuf);
+            
+            // Wait for "DATA:4096" marker
+            serial.readString(lineBuf, '\n', 256, 2000);  // command echo
+            serial.readString(lineBuf, '\n', 256, 2000);  // DATA:count line
+            
+            // Read 4096 bytes of raw data
+            int bytesRead = serial.readBytes(buf, 4096, 30000, 100);
+            if (bytesRead != 4096) {
+                printf("\nError: Expected 4096 bytes, got %d at bank %d chunk %d\n", bytesRead, bank, chunk);
+                outFile.close();
+                return -1;
+            }
+            
+            // Consume the OK and prompt
+            serial.readString(lineBuf, '\n', 256, 1000);  // empty line after data
+            serial.readString(lineBuf, '\n', 256, 1000);  // OK
+            serial.readString(lineBuf, '>', 256, 1000);   // prompt
+            
+            outFile.write(buf, 4096);
+            totalBytes += 4096;
+        }
+        
+        printf("\rBank %d/%d (%lu KB)", bank + 1, numBanks, totalBytes / 1024);
+        fflush(stdout);
+    }
+    
+    outFile.close();
+    printf("\nDone! Wrote %lu bytes to %s\n", totalBytes, filename.c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
 
     serialib serial;
@@ -40,7 +110,10 @@ int main(int argc, char** argv) {
     cxxopts::Options options("GTFO", "GameTank Flashing Overhauled");
     options.add_options()
         ("filenames", "The filename(s) to process", cxxopts::value<std::vector<string>>())
-        ("p", "Serial port", cxxopts::value<string>()->default_value(SERIAL_PORT));
+        ("p", "Serial port", cxxopts::value<string>()->default_value(SERIAL_PORT))
+        ("r,read", "Read mode - dump flash contents to file")
+        ("s,start", "Starting bank number for read (default 0)", cxxopts::value<int>()->default_value("0"))
+        ("n,numbanks", "Number of banks to read (default 128 = 2MB)", cxxopts::value<int>()->default_value("128"));
     options.parse_positional({"filenames"});
     auto cmdLineResults = options.parse(argc, argv);
     char errorOpen = serial.openDevice(cmdLineResults["p"].as<string>().c_str(), 115200);
@@ -52,16 +125,26 @@ int main(int argc, char** argv) {
 
     auto filenames = cmdLineResults["filenames"].as<vector<string>>();
 
-    if(checkBankExtension(filenames.front().c_str()) != -1) {
-        usingBankFiles = true;
-    }  
-
     if(errorOpen != 1) {
         printf("Couldn't connect to %s\n", cmdLineResults["p"].as<string>().c_str());
         return errorOpen;
     }
 
     printf("Connected to %s\n", cmdLineResults["p"].as<string>().c_str());
+
+    // Read mode
+    if(cmdLineResults.count("read")) {
+        int startBank = cmdLineResults["start"].as<int>();
+        int numBanks = cmdLineResults["numbanks"].as<int>();
+        int result = readFlashToFile(serial, filenames.front(), startBank, numBanks);
+        serial.closeDevice();
+        return result;
+    }
+
+    // Write mode (original behavior)
+    if(checkBankExtension(filenames.front().c_str()) != -1) {
+        usingBankFiles = true;
+    }  
 
     SerialStateMachine machine(serial);
 

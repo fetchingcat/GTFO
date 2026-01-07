@@ -12,7 +12,7 @@ SerialMessage StringListNode::onEnter() {
     SerialMessage newMessage = msgTemplate;
     if(it!=cmds.end()) {
         newMessage.length = strlen(it->c_str());
-        newMessage.data = (char*) calloc(newMessage.length, sizeof(char));
+        newMessage.data = (char*) calloc(newMessage.length + 1, sizeof(char));  // +1 for null terminator
         strcpy(newMessage.data, it->c_str());
         ++it;
         if(it==cmds.end()) {
